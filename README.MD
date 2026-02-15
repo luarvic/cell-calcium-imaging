@@ -1,27 +1,27 @@
 # Cell Calcium Imaging
 
-This project uses https://github.com/flatironinstitute/CaImAn
+This project uses https://github.com/flatironinstitute/CaImAn.
 
-To run the scripts you need first to activate `conda`:
+To run the scripts, first activate `conda`:
 
 ```zsh
 conda activate caiman
 ```
 
-Next, to run Jupyter notebook:
+Next, start Jupyter Notebook:
 
 ```zsh
 jupyter notebook
 ```
 
-To run the analysis in `Jupyter` execute these:
+To run the analysis in Jupyter, execute:
 
 ```
-# Generate maps for all tiffs and then postprocess (scan all results under --outroot)
+# Generate maps for all TIFFs, then postprocess (scan all results under --outroot)
 !python caiman_pipeline.py --inputs ./tiffs --fr 4 --outroot results
 !python postprocess.py --outroot results --fr 4 --plots_dir plots --thr_frac 0.2 --zscore --heatmap --pdf
 
-# Generate maps for well1-000.tif and then postprocess (single results folder)
+# Generate maps for well1-000.tif, then postprocess (single results folder)
 !python caiman_pipeline.py --inputs ./tiffs/well1-000.tif --fr 4 --outroot results
 !python postprocess.py --results results/well1-000 --fr 4 --plots_dir plots --thr_frac 0.2 --zscore --heatmap --pdf
 
