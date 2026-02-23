@@ -227,13 +227,13 @@ def main():
     ap.add_argument(
         "--thr_mode",
         choices=["frac", "percentile"],
-        default="frac",
+        default="percentile",
         help="Mask threshold mode: fraction of max or percentile of nonzero footprint values.",
     )
     ap.add_argument(
         "--thr_percentile",
         type=float,
-        default=70.0,
+        default=90.0,
         help="Percentile (0..100) for per-ROI thresholding when --thr_mode percentile.",
     )
     ap.add_argument("--label_all", action="store_true", help="Create a labeled ROI map for all neurons")
@@ -256,12 +256,16 @@ def main():
         help="Minimum pixel distance between label positions when jittering.",
     )
     ap.add_argument("--dedup", action="store_true", help="Use *_dedup outputs if present (from deduplicate_rois.py)")
+    ap.add_argument("--cells", action="store_true", help="Use *_cells outputs if present (cell-level ROIs from deduplicate_rois_cellify.py --cellify).")
     ap.add_argument("--mmap", default=None, help="Path to .mmap file (optional). If omitted, auto-detect in results folder.")
     ap.add_argument("--out", default=None, help="Output PNG for single neuron plot (optional)")
     args = ap.parse_args()
 
     results = Path(args.results).expanduser().resolve()
-    if args.dedup:
+    if args.cells:
+        A_path = results / "A_spatial_components_cells.npz"
+        F_path = results / "F_dff_cells.npy"
+    elif args.dedup:
         A_path = results / "A_spatial_components_dedup.npz"
         F_path = results / "F_dff_dedup.npy"
     else:
@@ -327,7 +331,7 @@ def main():
 
     # Labeled map for all ROIs
     if args.label_all:
-        out_all = results / ("roi_index_map_dedup.png" if args.dedup else "roi_index_map.png")
+        out_all = results / ("roi_index_map_cells.png" if args.cells else ("roi_index_map_dedup.png" if args.dedup else "roi_index_map.png"))
         label_all_rois(
             A,
             bg_img,

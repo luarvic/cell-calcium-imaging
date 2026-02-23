@@ -325,6 +325,304 @@ def pick_representative(indices: list[int], F_dff: np.ndarray | None, norms: np.
     return indices[int(np.argmax(vals))]
 
 
+def soma_likeness_score(a_norm_2d: np.ndarray, core_mask: np.ndarray | None) -> float:
+    """Higher = more soma-like (compact blob)."""
+    a_pos = np.maximum(a_norm_2d, 0.0)
+    peak = float(a_pos.max()) if a_pos.size else 0.0
+    if core_mask is None:
+        # fallback: use all positive pixels
+        ys, xs = np.where(a_pos > 0)
+    else:
+        ys, xs = np.where(core_mask)
+        if xs.size == 0:
+            ys, xs = np.where(a_pos > 0)
+
+    if xs.size == 0:
+        return -1e9
+
+    area = float(xs.size)
+
+    # compactness via covariance eigenvalue ratio (penalize elongated shapes)
+    y = ys.astype(float)
+    x = xs.astype(float)
+    y -= y.mean()
+    x -= x.mean()
+    cov_yy = float(np.mean(y * y)) + 1e-9
+    cov_xx = float(np.mean(x * x)) + 1e-9
+    cov_yx = float(np.mean(y * x))
+    # eigenvalues of 2x2 covariance
+    tr = cov_yy + cov_xx
+    det = cov_yy * cov_xx - cov_yx * cov_yx
+    disc = max(tr * tr - 4.0 * det, 0.0) ** 0.5
+    l1 = 0.5 * (tr + disc)
+    l2 = 0.5 * (tr - disc)
+    elong = float(l1 / max(l2, 1e-9))  # >= 1
+
+    # peak density favors compact somas over large diffuse neuropil
+    peak_density = peak / max(area, 1.0)
+    # final score: favor high peak density and low elongation
+    return peak_density / (1.0 + 0.3 * (elong - 1.0))
+
+
+def pick_cell_representative(
+    indices: list[int],
+    *,
+    A: csc_matrix,
+    dims: tuple[int, int] | None,
+    mask_thr: float,
+    F_dff: np.ndarray | None,
+) -> int:
+    """Pick one ROI to represent a cell among soma+process ROIs."""
+    if dims is None:
+        # Fallback: pick strongest activity variance (often soma-dominant)
+        if F_dff is not None and F_dff.size > 0:
+            vars_ = [float(np.nanvar(F_dff[i])) for i in indices]
+            return indices[int(np.argmax(vars_))]
+        return indices[0]
+
+    d1, d2 = dims
+    # Precompute core masks for candidates
+    best = indices[0]
+    best_score = -1e18
+    for i in indices:
+        a = A[:, i].toarray().ravel()
+        if a.size != d1 * d2:
+            continue
+        a2 = a.reshape((d1, d2), order="F")
+        a_max = float(np.max(a2))
+        core = None
+        if a_max > 0:
+            core = a2 >= (mask_thr * a_max)
+        score = soma_likeness_score(a2, core)
+        # tie-breaker: higher trace variance
+        if F_dff is not None and F_dff.size > 0:
+            score += 1e-3 * float(np.nanvar(F_dff[i]))
+        if score > best_score:
+            best_score = score
+            best = i
+    return best
+
+
+@dataclass
+class CellifyResult:
+    kept_indices: list[int]
+    dropped_indices: list[int]
+    groups: list[list[int]]
+    representative_for_group: list[int]
+
+
+def cellify(
+    A: csc_matrix,
+    *,
+    F_dff: np.ndarray | None,
+    dims: tuple[int, int] | None,
+    max_dist: float,
+    mask_thr: float,
+    iou_thr: float,
+    overlap_thr: float,
+    pixel_dist_thr: float,
+    soma_nms_dist: float | None = None,
+) -> CellifyResult:
+    """Collapse CNMF components into *cell-level* ROIs (1 label per soma).
+
+    Goal: produce publication-friendly *one ROI per cell* by:
+      1) scoring each ROI for soma-likeness (compact blob)
+      2) keeping only soma-like ROIs as representatives
+      3) assigning process-like ROIs to the nearest soma (and dropping them)
+
+    This avoids having multiple labels for soma+process fragments.
+    """
+    n = A.shape[1]
+    if n <= 1:
+        return CellifyResult(kept_indices=list(range(n)), dropped_indices=[], groups=[], representative_for_group=[])
+
+    if dims is None:
+        # Without dims we can't reliably measure morphology; fall back to the old conservative grouping.
+        uf = UnionFind(n)
+        kept = list(range(n))
+        return CellifyResult(kept_indices=kept, dropped_indices=[], groups=[], representative_for_group=[])
+
+    d1, d2 = dims
+    cent = centroids_from_A(A, dims)
+
+    # Build core masks once (used for area/overlap/pixel-dist and soma scoring)
+    cores, core_sizes = core_masks_from_A(A, mask_thr=mask_thr)
+    trees = core_trees_from_indices(cores, dims) if cores is not None else None
+
+    # Soma-likeness score per ROI
+    scores = np.full((n,), -1e9, dtype=float)
+    for i in range(n):
+        if core_sizes[i] == 0:
+            continue
+        a = A[:, i].toarray().ravel()
+        if a.size != d1 * d2:
+            continue
+        a2 = a.reshape((d1, d2), order="F")
+        a_max = float(np.max(a2))
+        core = None
+        if a_max > 0:
+            core = a2 >= (mask_thr * a_max)
+        scores[i] = float(soma_likeness_score(a2, core))
+
+    # Heuristics: pick soma candidates by score percentile and a minimal core area.
+    # Area threshold removes tiny specks; percentile adapts to each field.
+    finite_scores = scores[np.isfinite(scores)]
+    if finite_scores.size == 0:
+        finite_scores = np.array([-1e9])
+    score_thr = float(np.nanpercentile(finite_scores, 60))  # keep top 40% most soma-like
+    area_min = max(15, int(np.nanpercentile(core_sizes.astype(float), 20)))  # adaptive, but at least 15 px
+    soma_candidates = [i for i in range(n) if (scores[i] >= score_thr and core_sizes[i] >= area_min)]
+
+    # Fallback: if too strict, at least keep the best-scoring ROI
+    if not soma_candidates:
+        soma_candidates = [int(np.nanargmax(scores))]
+
+    # Step 1: merge soma candidates that are actually the same soma (very close/overlapping),
+    # then pick one representative per soma-cluster.
+    uf = UnionFind(n)
+    for ii, i in enumerate(soma_candidates):
+        for j in soma_candidates[ii + 1:]:
+            if np.any(np.isnan(cent[i])) or np.any(np.isnan(cent[j])):
+                continue
+            dy = float(cent[i, 0] - cent[j, 0])
+            dx = float(cent[i, 1] - cent[j, 1])
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist > float(max_dist):
+                continue
+
+            iou, ov = iou_and_overlap(cores[i], cores[j])
+            close_pixels = False
+            if trees is not None:
+                md = min_core_pixel_dist(trees[i], trees[j])
+                close_pixels = md <= float(pixel_dist_thr)
+
+            if iou >= float(iou_thr) or ov >= float(overlap_thr) or close_pixels:
+                uf.union(i, j)
+
+    comp: dict[int, list[int]] = {}
+    for i in soma_candidates:
+        r = uf.find(i)
+        comp.setdefault(r, []).append(i)
+
+    soma_groups = [sorted(v) for v in comp.values()]
+    soma_groups.sort(key=lambda g: g[0])
+
+    soma_reps: list[int] = []
+    for g in soma_groups:
+        soma_reps.append(pick_cell_representative(g, A=A, dims=dims, mask_thr=mask_thr, F_dff=F_dff))
+
+
+
+    # Optional Soma NMS: keep at most one soma representative per neighborhood.
+    # This prevents multiple labels on one apparent soma when CNMF over-segments it.
+    _nms = float(soma_nms_dist) if soma_nms_dist is not None else float(max_dist) * 1.8
+    if len(soma_reps) > 1 and _nms > 0:
+        # Sort by soma-likeness score (best first)
+        soma_reps_sorted = sorted(soma_reps, key=lambda i: scores[i], reverse=True)
+        kept_somas: list[int] = []
+        for i in soma_reps_sorted:
+            if np.any(np.isnan(cent[i])):
+                continue
+            yi, xi = cent[i, 0], cent[i, 1]
+            too_close = False
+            for j in kept_somas:
+                yj, xj = cent[j, 0], cent[j, 1]
+                dy = float(yi - yj)
+                dx = float(xi - xj)
+                if (dx * dx + dy * dy) ** 0.5 <= _nms:
+                    too_close = True
+                    break
+            if not too_close:
+                kept_somas.append(i)
+        soma_reps = kept_somas
+
+    # Step 2: assign every non-soma ROI to the nearest soma rep if it's close enough spatially.
+    # (process-like ROIs are dropped; soma reps are kept)
+    assignments: dict[int, list[int]] = {rep: [rep] for rep in soma_reps}
+    dropped: set[int] = set()
+
+    def _dist(a: int, b: int) -> float:
+        dy = float(cent[a, 0] - cent[b, 0])
+        dx = float(cent[a, 1] - cent[b, 1])
+        return (dx * dx + dy * dy) ** 0.5
+
+    # A bit more permissive than soma merge: processes can extend away from soma center.
+    assign_max_dist = float(max_dist) * 1.8
+
+    soma_rep_set = set(soma_reps)
+    for i in range(n):
+        if i in soma_rep_set:
+            continue
+        if core_sizes[i] == 0:
+            continue
+
+        # Find nearest soma rep by centroid distance
+        best_rep = None
+        best_d = 1e18
+        for rep in soma_reps:
+            d = _dist(i, rep)
+            if d < best_d:
+                best_d = d
+                best_rep = rep
+
+        if best_rep is None or best_d > assign_max_dist:
+            # Far from any soma rep: keep as separate cell.
+            assignments.setdefault(i, [i])
+            soma_reps.append(i)
+            soma_rep_set.add(i)
+            continue
+
+        # Confirm spatial relation by overlap or pixel-distance (prevents accidental merges)
+        iou, ov = iou_and_overlap(cores[i], cores[best_rep])
+        close_pixels = False
+        if trees is not None:
+            md = min_core_pixel_dist(trees[i], trees[best_rep])
+            close_pixels = md <= float(pixel_dist_thr) * 2.0  # processes can be farther
+
+        if (iou >= float(iou_thr) * 0.5) or (ov >= float(overlap_thr) * 0.5) or close_pixels:
+            assignments[best_rep].append(i)
+            dropped.add(i)
+        else:
+            # If this ROI is very close to an existing soma rep, treat it as a process fragment
+            # even if overlap is weak (prevents multiple labels on one soma).
+            if best_d <= _nms:
+                assignments[best_rep].append(i)
+                dropped.add(i)
+            else:
+                # keep as separate cell (safer than over-merging neighbors)
+                assignments.setdefault(i, [i])
+                soma_reps.append(i)
+                soma_rep_set.add(i)
+
+    # Final: groups are the assignment lists with >1 members
+    groups = [sorted(v) for v in assignments.values() if len(v) > 1]
+    groups.sort(key=lambda g: g[0])
+
+    # Representatives correspond to each multi-member group (first element is rep in our assignment dict)
+    rep_for_group = []
+    for g in groups:
+        # pick rep among the group using soma-likeness (ensures soma kept)
+        rep_for_group.append(pick_cell_representative(g, A=A, dims=dims, mask_thr=mask_thr, F_dff=F_dff))
+
+    kept = [i for i in range(n) if i not in dropped]
+
+    # But we want exactly one ROI per cell: keep only the reps of every assignment group
+    # (including singleton groups)
+    final_kept: list[int] = []
+    for rep, members in assignments.items():
+        rep2 = pick_cell_representative(members, A=A, dims=dims, mask_thr=mask_thr, F_dff=F_dff)
+        final_kept.append(rep2)
+    final_kept = sorted(set(final_kept))
+
+    # Anything not in final_kept is dropped (even if not assigned), to ensure 1 ROI per cell.
+    dropped_all = sorted([i for i in range(n) if i not in final_kept])
+
+    return CellifyResult(
+        kept_indices=final_kept,
+        dropped_indices=dropped_all,
+        groups=groups,
+        representative_for_group=rep_for_group,
+    )
 def deduplicate(
     A: csc_matrix,
     *,
@@ -489,6 +787,12 @@ def main() -> None:
         help="Print diagnostic top pairs within --max_dist by corr/IoU/overlap (0 disables).",
     )
     ap.add_argument("--dry_run", action="store_true", help="Only report duplicates; do not write *_dedup files")
+    ap.add_argument("--cellify", action="store_true", help="Collapse soma+process ROIs into one cell-level ROI per cell (publication-friendly).")
+    ap.add_argument("--cell_max_dist", type=float, default=15.0, help="Max centroid distance (px) for grouping ROIs into the same cell.")
+    ap.add_argument("--cell_iou_thr", type=float, default=0.02, help="Min IoU between core masks to group ROIs into same cell.")
+    ap.add_argument("--cell_overlap_thr", type=float, default=0.10, help="Min overlap fraction between core masks to group ROIs into same cell.")
+    ap.add_argument("--cell_pixel_dist_thr", type=float, default=8.0, help="Max min pixel distance between core masks to group ROIs into same cell.")
+    ap.add_argument("--soma_nms_dist", type=float, default=None, help="Non-maximum suppression distance (px) for soma candidates in --cellify. Keeps only one soma-like ROI per neighborhood. Default: cell_max_dist*1.8.")
     args = ap.parse_args()
 
     results = Path(args.results).expanduser().resolve()
@@ -585,13 +889,56 @@ def main() -> None:
     with open(results / "dedup_map.json", "w", encoding="utf-8") as f:
         json.dump(mapping, f, indent=2)
 
-    print("Wrote:")
-    print("  A_spatial_components_dedup.npz")
-    if F_dff is not None:
-        print("  F_dff_dedup.npy")
-    if S_path.exists():
-        print("  S_deconv_dedup.npy")
-    print("  dedup_map.json")
+    
+    # Optional: collapse soma+process ROIs into one cell-level ROI per cell
+    if args.cellify:
+        if dims is None:
+            print("[cellify] WARNING: could not determine dims; skipping cellify (needs mmap or dims). Provide --mmap.")
+        else:
+            A_in = A_dedup
+            F_in = (F_dff[kept] if F_dff is not None else None)
+            S_in = None
+            if S_path.exists():
+                S = np.load(str(S_path))
+                S_in = S[kept]
+
+            cell_res = cellify(
+                A_in,
+                F_dff=F_in,
+                dims=dims,
+                max_dist=float(args.cell_max_dist),
+                mask_thr=float(args.mask_thr),
+                iou_thr=float(args.cell_iou_thr),
+                overlap_thr=float(args.cell_overlap_thr),
+                pixel_dist_thr=float(args.cell_pixel_dist_thr),
+                soma_nms_dist=float(args.soma_nms_dist) if args.soma_nms_dist is not None else None,
+            )
+            kept_c = np.array(cell_res.kept_indices, dtype=int)
+            A_cells = A_in[:, kept_c]
+            save_npz(results / "A_spatial_components_cells.npz", A_cells.tocsc())
+            if F_in is not None:
+                np.save(results / "F_dff_cells.npy", F_in[kept_c])
+            if S_in is not None:
+                np.save(results / "S_deconv_cells.npy", S_in[kept_c])
+
+            cell_mapping = {
+                "results": str(results),
+                "based_on": "dedup",
+                "cell_max_dist": float(args.cell_max_dist),
+                "cell_iou_thr": float(args.cell_iou_thr),
+                "cell_overlap_thr": float(args.cell_overlap_thr),
+                "cell_pixel_dist_thr": float(args.cell_pixel_dist_thr),
+                "mask_thr": float(args.mask_thr),
+                "n_rois_dedup": int(A_in.shape[1]),
+                "kept_indices": cell_res.kept_indices,
+                "dropped_indices": cell_res.dropped_indices,
+                "groups": cell_res.groups,
+                "representative_for_group": cell_res.representative_for_group,
+            }
+            with open(results / "cell_map.json", "w", encoding="utf-8") as f:
+                json.dump(cell_mapping, f, indent=2)
+
+            print(f"[cellify] Cells kept: {len(cell_res.kept_indices)}  dropped: {len(cell_res.dropped_indices)}  groups: {len(cell_res.groups)}")
 
 
 if __name__ == "__main__":

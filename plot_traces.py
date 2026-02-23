@@ -34,16 +34,28 @@ def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
-def load_array(results_dir: Path, which: str, dedup: bool) -> np.ndarray:
+def load_array(results_dir: Path, which: str, dedup: bool, cells: bool) -> np.ndarray:
     which_l = which.lower().strip()
     if which_l in ("f", "fdff", "f_dff", "dff"):
-        fname = results_dir / ("F_dff_dedup.npy" if dedup else "F_dff.npy")
+        if cells:
+            fname = results_dir / "F_dff_cells.npy"
+        else:
+            fname = results_dir / ("F_dff_dedup.npy" if dedup else "F_dff.npy")
     elif which_l in ("s", "deconv", "s_deconv", "spikes"):
-        fname = results_dir / ("S_deconv_dedup.npy" if dedup else "S_deconv.npy")
+        if cells:
+            fname = results_dir / "S_deconv_cells.npy"
+        else:
+            fname = results_dir / ("S_deconv_dedup.npy" if dedup else "S_deconv.npy")
     else:
         raise ValueError("Unknown --use value. Use 'F' (default) or 'S'.")
 
     if not fname.exists():
+        if cells:
+            raise FileNotFoundError(
+                f"Missing file: {fname}\n"
+                "You passed --cells but cell-level outputs were not found. "
+                "Run deduplicate_rois_cellify.py with --cellify first (or omit --cells)."
+            )
         if dedup:
             raise FileNotFoundError(
                 f"Missing file: {fname}\n"
@@ -134,6 +146,7 @@ def main():
     ap.add_argument("--fr", type=float, required=True, help="Frame rate (Hz) used for time axis.")
     ap.add_argument("--use", default="F", help="Which array to plot: F (ΔF/F0) or S (deconvolved). Default F.")
     ap.add_argument("--dedup", action="store_true", help="Use *_dedup outputs if present (from deduplicate_rois.py)")
+    ap.add_argument("--cells", action="store_true", help="Use *_cells outputs if present (from deduplicate_rois_cellify.py --cellify)")
     ap.add_argument("--plots_dir", default="plots", help="Subfolder inside results to write plots into.")
     ap.add_argument("--traces_per_page", type=int, default=64, help="How many traces per grid page image.")
     ap.add_argument("--ncols", type=int, default=4, help="Number of columns in trace grid.")
@@ -150,7 +163,10 @@ def main():
     if not results_dir.exists():
         raise SystemExit(f"Results directory not found: {results_dir}")
 
-    X = load_array(results_dir, args.use, dedup=bool(args.dedup))
+    if args.cells and args.dedup:
+        raise SystemExit("Use only one of --cells or --dedup.")
+
+    X = load_array(results_dir, args.use, dedup=bool(args.dedup), cells=bool(args.cells))
     if X.ndim != 2:
         raise SystemExit(f"Expected 2D array (neurons, frames). Got shape={X.shape}")
 
